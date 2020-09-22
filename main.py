@@ -4,7 +4,7 @@ import random
 import argparse
 import pickle
 import numpy as np
-from model import fm
+from model import fm,TFnet
 from utils import data_preprocess
 import torch
 
@@ -16,6 +16,8 @@ parser.add_argument('-n_epochs', default=10, type=int, help='number of epochs')
 parser.add_argument('-batch_size', default=2048, type=int, help='batch size')
 parser.add_argument('-lr', default=0.001, type=float, help='learning rate')
 parser.add_argument('-l2', default=3e-7, type=float, help='L2 penalty')
+parser.add_argument('-is_fw', default=1, type=int, help='is use field weight model')
+parser.add_argument('-is_deep', default=1, type=int, help='use deep layer or not')
 
 pars = parser.parse_args()
 
@@ -44,8 +46,11 @@ with open('data/test_dict.pickle', 'rb') as f:
 #         model.fit(result_dict['index'], result_dict['value'], result_dict['label'], test_dict['index'],
 #                   test_dict['value'], test_dict['value'])
 if __name__ =='__main__':
-        model = fm.fm(field_num=39, feature_sizes=result_dict['feature_sizes'], embedding_dim=pars.embedding_dim,
+        model = TFnet.TFnet(field_num=39, feature_sizes=result_dict['feature_sizes'], embedding_dim=pars.embedding_dim,
                       n_epochs=pars.n_epochs, batch_size=pars.batch_size, learning_rate=pars.lr, weight_decay=pars.l2,
-                      numerical=13, use_cuda=pars.use_cuda)
+                      numerical=13, use_cuda=pars.use_cuda, m=4, deep_node=512, deep_layer=3)
+        # model = fm.fm(field_num=39, feature_sizes=result_dict['feature_sizes'], embedding_dim=pars.embedding_dim,
+        #               n_epochs=pars.n_epochs, batch_size=pars.batch_size, learning_rate=pars.lr, weight_decay=pars.l2,
+        #               numerical=13, use_cuda=pars.use_cuda, is_fwfm=pars.is_fw, is_deep=pars.is_deep)
         model.fit(result_dict['index'], result_dict['value'], result_dict['label'], test_dict['index'],
                        test_dict['value'], test_dict['label'])

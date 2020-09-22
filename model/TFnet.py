@@ -8,29 +8,33 @@ from torch.autograd import Variable
 from sklearn.metrics import roc_auc_score
 import os
 from time import time
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
-class fm(nn.Module):
+class TFnet(nn.Module):
     def __init__(self, field_num, feature_sizes, embedding_dim, n_epochs, batch_size, learning_rate, weight_decay,
-                 numerical, use_cuda, is_fwfm, is_deep, dropout=[0.5, 0.5, 0.5, 0.5], deep_node=400, deep_layer=3):
-        super(fm, self).__init__()
+                 numerical, use_cuda, m, deep_node, deep_layer):
+        super(TFnet, self).__init__()
         self.deep_layer = deep_layer
         self.deep_node = deep_node
-        self.dropout = dropout
-        self.is_deep = is_deep
-        self.is_fwfm = is_fwfm
-        self.field_num = field_num
-        self.feature_sizes = feature_sizes
-        self.embedding_dim = embedding_dim
+        self.m = m
         self.n_epochs = n_epochs
         self.batch_size = batch_size
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.numerical = numerical
         self.use_cuda = use_cuda
-
-        self.bias = nn.Parameter(torch.Tensor([0.01]))
+        self.embedding_dim = embedding_dim
+        self.feature_sizes = feature_sizes
+        self.field_num = field_num
+        self.interaction = field_num * (field_num - 1) // 2
+        self.left = []
+        self.right = []
+        for i in range(field_num):
+            for j in range(i+1, field_num):
+                self.left.append(i)
+                self.right.append(j)
 
         self.fm_1st_embedding = nn.ModuleList([
             nn.Embedding(feature_size, 1) for feature_size in feature_sizes
@@ -39,69 +43,71 @@ class fm(nn.Module):
             nn.Embedding(feature_size, embedding_dim) for feature_size in feature_sizes
         ])
 
-        if is_fwfm:
-            self.field_cov = nn.Linear(self.field_num, self.field_num, bias=False)
-            nn.init.xavier_uniform_(self.field_cov.weight)
+        self.T3 = nn.Parameter(torch.randn(embedding_dim, m, embedding_dim))
+        self.T2 = nn.Parameter(torch.randn(m, embedding_dim * embedding_dim))
+        self.gc = nn.Parameter(torch.randn(self.interaction))
 
-        if is_deep:
-            setattr(self, 'init_dropout', nn.Dropout(self.dropout[0]))
-            setattr(self, 'init_linear', nn.Linear(self.field_num * self.embedding_dim, self.deep_node))
-            setattr(self, 'init_batchNorm', nn.BatchNorm1d(self.deep_node, momentum=0.005))
-            setattr(self, 'init_dropout2', nn.Dropout(self.dropout[0]))
-            for i in range(1, self.deep_layer+1):
-                setattr(self, 'net_' + str(i) + 'linear', nn.Linear(self.deep_node, self.deep_node))
-                setattr(self, 'net_' + str(i) + 'batchNorm', nn.BatchNorm1d(self.deep_node, momentum=0.005))
-                setattr(self, 'net_' + str(i) + 'dropout', nn.Dropout(self.dropout[i]))
-            setattr(self, 'fc', nn.Linear(self.deep_node, 1, bias=False))
+        '''
+           deep part for higher order feature interaction 
+        '''
+        setattr(self, 'init_fi_dropout', nn.Dropout(0.5))
+        setattr(self, 'init_fi_linear', nn.Linear(self.interaction * self.m, deep_node))
+        setattr(self, 'init_fi_batchNorm', nn.BatchNorm1d(deep_node, momentum=0.05))
+        # setattr(self, 'init_fi_dropout2', nn.Dropout(0.5))
+        # for i in range(1, self.deep_layer+1):
+        #     setattr(self, str(i) + '_fi_dropout', nn.Dropout(0.5))
+        #     setattr(self, str(i) + '_fi_linear', nn.Linear(deep_node, deep_node))
+        #     setattr(self, str(i) + '_fi_batchNorm', nn.BatchNorm1d(deep_node, momentum=0.05))
+
+        '''
+           deep part for embedding concat 
+        '''
+        setattr(self, 'init_emb_dropout', nn.Dropout(0.5))
+        setattr(self, 'init_emb_linear', nn.Linear(self.embedding_dim * self.field_num, deep_node))
+        setattr(self, 'init_emb_batchNorm', nn.BatchNorm1d(deep_node, momentum=0.05))
+
+        '''
+           final concat linear layer
+        '''
+        self.fc = nn.Linear(deep_node * 2, 1)
 
     def forward(self, xi, xv):
-        """
-
-        :param xi: embedding index of categories feature, dim: batch x 26
-        :param xv: real value of continuous feature, dim:  batch x 13
-        :return: predict value of click through rate
-        """
-
-        # for all continuous feature, embedding index always is 0
         Tzero = torch.zeros(xi.shape[0], 1, dtype=torch.long)
         if self.use_cuda:
             Tzero = Tzero.cuda()
-
-        fm_1st_emb_arr = [(torch.sum(emb(Tzero), 1).t() * xv[:, i]).t() if i < self.numerical else
-                          emb(xi[:, i - self.numerical]) for i, emb in enumerate(self.fm_1st_embedding)]
-        fm_1st_order = torch.cat(fm_1st_emb_arr, 1)  # dim: B x 39
 
         fm_2nd_emb_arr = [(torch.sum(emb(Tzero), 1).t() * xv[:, i]).t() if i < self.numerical else
                           emb(xi[:, i - self.numerical]) for i, emb in enumerate(self.fm_2nd_embedding)]
 
         fm_2nd_order_tensor = torch.stack(fm_2nd_emb_arr, dim=1)  # dim: B x 39 x D
+        vi = [fm_2nd_emb_arr[i] for i in self.left]
+        vj = [fm_2nd_emb_arr[i] for i in self.right]
+        vi = torch.stack(vi, dim=1)  # bqd
+        vj = torch.stack(vj, dim=1)  # bqd
+        # ga 有问题， ga 是一个m维的向量，应该是bm 然后softmax
+        ga = torch.einsum('bqd,dmd,bqd->bm', vi, self.T3, vj)
+        ga = F.softmax(ga, dim=1)  # bm
+        # T1 有问题， T1 应该是bdmd 每一个row 对应一个T1，总共有batch个
+        T1 = torch.einsum('bm,mn->bmn', ga, self.T2)
+        # T1 = T1.reshape(-1, self.m, self.embedding_dim, self.embedding_dim)
+        s = torch.einsum('bqd,bmn,bqd->bqm', vi, T1, vj)
+        sh = torch.einsum('bqm,q->bqm', s, self.gc)
+        sh = sh.reshape(-1, self.interaction * self.m)
+        th = getattr(self, 'init_fi_dropout')(sh)
+        th = getattr(self, 'init_fi_linear')(th)
+        th = getattr(self, 'init_fi_batchNorm')(th)
+        th = torch.relu(th)
 
-        outer_fm = torch.einsum('bfd,bld->bfld', fm_2nd_order_tensor, fm_2nd_order_tensor)
-        if self.is_fwfm:
-            outer_fm = torch.einsum('bijk,ij->bijk', outer_fm, (self.field_cov.weight.t() + self.field_cov.weight) / 2)
-        fm_2nd_order = 0.5 * (torch.sum(torch.sum(outer_fm, 1), 1) - torch.sum(torch.einsum('bijk->bik', outer_fm), 1))
-        '''
-            deep part
-        '''
-        if self.is_deep:
-            deep_tensor = torch.cat(fm_2nd_emb_arr, 1)
-            activation = torch.relu
-            deep = getattr(self, 'init_dropout')(deep_tensor)
-            deep = getattr(self, 'init_linear')(deep)
-            deep = getattr(self, 'init_batchNorm')(deep)
-            deep = activation(deep)
-            deep = getattr(self, 'init_dropout2')(deep)
-            for i in range(1, self.deep_layer+1):
-                deep = getattr(self, 'net_' + str(i) + 'linear')(deep)
-                deep = getattr(self, 'net_' + str(i) + 'batchNorm')(deep)
-                deep = activation(deep)
-                deep = getattr(self, 'net_' + str(i) + 'dropout')(deep)
-            deep = getattr(self, 'fc')(deep)
+        emb = torch.cat(fm_2nd_emb_arr, 1)
+        emb = getattr(self, 'init_emb_dropout')(emb)
+        emb = getattr(self, 'init_emb_linear')(emb)
+        emb = getattr(self, 'init_emb_batchNorm')(emb)
+        emb = torch.relu(emb)
 
-        total_sum = torch.sum(fm_1st_order, 1) + torch.sum(fm_2nd_order, 1) + self.bias
-        if self.is_deep:
-            total_sum += torch.sum(deep, 1)
-        return total_sum
+        outputs = torch.cat((th, emb), dim=1)
+        outputs = self.fc(outputs)
+        outputs = torch.sigmoid(outputs)
+        return torch.sum(outputs, 1)
 
     def fit(self, xi_train, xv_train, y_train, xi_valid=None, xv_valid=None, y_valid=None):
         is_valid = False
@@ -122,7 +128,7 @@ class fm(nn.Module):
         model = self.train()
 
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        criterion = F.binary_cross_entropy_with_logits
+        criterion = F.binary_cross_entropy
 
         train_result = []
         valid_result = []
@@ -138,8 +144,6 @@ class fm(nn.Module):
             if '2nd' in name:
                 num_2nd_order_embeddings += np.prod(param.data.shape)
         print('Summation of feature sizes: %s' % (sum(self.feature_sizes)))
-        print('Number of 1st order embeddings: %d' % num_1st_order_embeddings)
-        print('Number of 2nd order embeddings: %d' % num_2nd_order_embeddings)
         print("Number of total parameters: %d" % num_total)
 
         for epoch in range(self.n_epochs):
@@ -160,6 +164,7 @@ class fm(nn.Module):
                     batch_xi, batch_xv, batch_y = batch_xi.cuda(), batch_xv.cuda(). batch_y.cuda()
                 optimizer.zero_grad()
                 outputs = model(batch_xi, batch_xv)
+                # print("outputs:", outputs.shape)
                 loss = criterion(outputs, batch_y)
                 loss.backward()
                 optimizer.step()
@@ -189,7 +194,7 @@ class fm(nn.Module):
         y_pred = []
         batch_size = 2048
         batch_iter = x_size // batch_size
-        criterion = F.binary_cross_entropy_with_logits
+        criterion = F.binary_cross_entropy
         model = self.eval()
         with torch.no_grad():
             for i in range(batch_iter + 1):
@@ -216,5 +221,7 @@ class fm(nn.Module):
 
     def inner_predict_proba(self, xi, xv):
         model = self.eval()
-        pred = torch.sigmoid(model(xi, xv)).cpu()
+        pred = model(xi, xv).cpu()
         return pred.data.numpy()
+
+
